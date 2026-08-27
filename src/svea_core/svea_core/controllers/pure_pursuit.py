@@ -32,8 +32,8 @@ class PurePursuitController:
     K_i = 0.01  # speed control integral gain
     
     # Anti-windup parameters
-    max_velocity = 0.5  # [m/s] maximum velocity output
-    min_velocity = -0.5  # [m/s] minimum velocity output (for reverse)
+    max_velocity = 1.0  # [m/s] maximum velocity output
+    min_velocity = -1.0  # [m/s] minimum velocity output (for reverse)
     integral_limit = 10.0  # maximum integral error accumulation
 
     L = 0.324  # [m] wheel base of vehicle
@@ -130,7 +130,7 @@ class PurePursuitController:
             ind += 1
 
         # terminating condition
-        if dist < 0.3:
+        if dist < 1.0:
             self.is_finished = True
             pass
 
