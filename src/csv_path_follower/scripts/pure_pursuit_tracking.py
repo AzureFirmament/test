@@ -7,38 +7,38 @@ Place in: csv_path_follower/scripts/path_follower.py
 Frames
 ------
 
-The CSV may be recorded in a frame other than the one the localizer reports
-in -- typically a motion capture frame. Two parameters control this:
+The CSV and the mocap topic are both expressed in path_frame; everything the
+controller does happens in target_frame:
 
-    path_frame     the frame the CSV numbers are expressed in   (e.g. 'mocap')
-    target_frame   the frame the localizer reports in           (e.g. 'map')
+    path_frame     the frame the CSV and the mocap pose are in  (e.g. 'mocap')
+    target_frame   the frame everything is converted into       (e.g. 'map')
 
-When they differ, the node waits for a planar transform target_frame <-
-path_frame, rewrites the CSV into target_frame, and only then builds the
-segments. Everything downstream -- pure pursuit, cross-track, markers,
-ShowPath -- therefore works in a single frame, the localizer's.
+When they differ the node waits for a planar transform target_frame <-
+path_frame, caches it, rewrites the CSV with it, and applies the SAME cached
+transform to every incoming mocap pose. Path, vehicle pose, target markers and
+map therefore all live in one frame and cannot drift apart.
 
-This is deliberately NOT done by transforming the vehicle pose the other way:
-that would leave the published path and target markers in the mocap frame,
-where they cannot be compared against the map.
+Converting only the path and leaving the pose in the mocap frame (or the other
+way round) yields a pure pursuit bearing that is wrong by the rotation between
+the frames. Nothing errors; the car simply drives somewhere else.
+
+Pose sources
+------------
+
+    is_sim=True    pose and speed both from LocalizationInterface.
+    is_sim=False   pose from mocap_pose_topic (converted), speed still from
+                   LocalizationInterface (wheel encoders).
+
+Both feeds are staleness-checked independently: a dead mocap feed alongside a
+live encoder feed would otherwise leave the controller steering against a
+frozen pose.
 
 State machine
 -------------
 
     WAIT_TF --> WAIT_ODOM --> DRIVE --> BRAKE --> DRIVE --> ... --> DONE
                                  |        |
-                                 +--------+--> ABORT  (cross-track, odom stale)
-
-  WAIT_TF    resolve target_frame <- path_frame, then load the path. Skipped
-             entirely when no conversion is needed.
-  WAIT_ODOM  wait for a fresh odometry message and check that the vehicle is
-             actually near the start of the path.
-  DRIVE      track the current segment with SegmentPurePursuit.
-  BRAKE      command zero speed, wait for the wheels to actually stop, pre-steer
-             for the next segment, and (if the direction flips) run the ESC
-             shift sequence. Only then advance to the next segment.
-  DONE       zero everything and stop the timer.
-  ABORT      zero everything and complain loudly.
+                                 +--------+--> ABORT  (cross-track, stale pose)
 
 Run:
     bl csv_path_follower path_follower.launch.py is_sim:=True
@@ -60,6 +60,7 @@ from rclpy.qos import (
     QoSHistoryPolicy,
 )
 from std_msgs.msg import Bool
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
 from svea_core import rosonic as rx
 from svea_core.interfaces import (
@@ -81,12 +82,34 @@ qos_subber = QoSProfile(
     depth=10,
 )
 
+# initialpose is a one-shot seed. Latch it so a consumer that starts late
+# still receives it instead of missing it entirely.
+qos_latched = QoSProfile(
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    depth=1,
+)
+
 
 def quaternion_to_yaw(q) -> float:
     """Planar yaw from a quaternion. Ignores roll/pitch by construction."""
     siny = 2.0 * (q.w * q.z + q.x * q.y)
     cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny, cosy)
+
+
+def apply_planar_tf(tf, x, y, yaw):
+    """Apply (tx, ty, theta) to a planar pose. tf=None is the identity.
+
+    One function for both the CSV rows and the live mocap poses, so the two
+    conversions cannot diverge.
+    """
+    if tf is None:
+        return x, y, yaw
+    tx, ty, th = tf
+    c, s = math.cos(th), math.sin(th)
+    return tx + c * x - s * y, ty + s * x + c * y, wrap_to_pi(yaw + th)
 
 
 class State(Enum):
@@ -106,10 +129,9 @@ class path_follower(rx.Node):
     path_csv = rx.Parameter("")
 
     # --- frames ---------------------------------------------------------
-    # path_frame:   what the CSV numbers mean.
-    # target_frame: what the localizer reports in. Set path_frame equal to
-    #               target_frame (or leave target_frame empty) to disable
-    #               conversion entirely.
+    # path_frame:   what the CSV numbers AND the mocap topic are expressed in.
+    # target_frame: what everything is converted into. Set the two equal (or
+    #               leave target_frame empty) to disable conversion entirely.
     path_frame = rx.Parameter("mocap")
     target_frame = rx.Parameter("map")
 
@@ -126,45 +148,44 @@ class path_follower(rx.Node):
     tf_override_y = rx.Parameter(0.0)
     tf_override_yaw = rx.Parameter(0.0)
 
-    # Geometry. Wheelbase matches PurePursuitController in svea_core.
+    # --- mocap ------------------------------------------------------------
+    is_sim = rx.Parameter(False)
+
+    mocap_pose_topic = rx.Parameter("/svea7/pose")
+    mocap_timeout = rx.Parameter(0.5)
+
+    # Seed the localizer with the first converted mocap pose. Set false when
+    # something else already owns initialpose -- two seeds fighting is worse
+    # than none.
+    publish_initial_pose = rx.Parameter(True)
+    # Relative by default so bl.group(name) namespaces it. A leading slash
+    # pins it to the root and a localizer under /<name> never hears it.
+    initial_pose_topic = rx.Parameter("/self/set_pose")
+
+    # --- geometry ---------------------------------------------------------
     wheelbase = rx.Parameter(0.324)
 
     # 40 deg, matching the limit the path was generated under and the
     # MAX_STEERING_ANGLE that ActuationInterface already assumes.
-    #
-    # ActuationInterface additionally clips at MAX_STEER_PERCENT = 90, so a
-    # 0.698 command actually leaves as 0.628 rad (36 deg). Simulated, that
-    # costs almost nothing: cusp heading error 15.8 -> 17.2 deg. Not worth
-    # touching the hardware-protection clip for.
     max_steering = rx.Parameter(0.70)
 
     # steering_gain = (angle ActuationInterface assumes) / (real angle).
-    # 1.0 while both are 40 deg. If the mechanical limit turns out to be
-    # 30 deg after all, set this to 1.3333 rather than leaving the controller
-    # to discover the 0.75 gain error on its own -- simulated, that mismatch
-    # pushes the cusp heading error from 15.8 to 19.5 deg at Ld=0.25 (and to
-    # 29 deg at Ld=0.35, which is why Ld is 0.25 below).
     steering_gain = rx.Parameter(1.0)
 
     # Constant servo offset, in radians of commanded angle. Positive steers
-    # left. mpc_path_tracking.py carries an equivalent value of 7 unitless
-    # counts for svea7 -- convert and put it here if you trust that number.
+    # left.
     steering_bias = rx.Parameter(0.0)
 
     # Sign applied to the commanded velocity before it reaches the LLI.
-    # -1.0 inverts. Confirm on the actual car with lli_test before trusting it.
     velocity_sign = rx.Parameter(-1.0)
 
-    # Speed profile
+    # --- speed profile ----------------------------------------------------
     target_speed = rx.Parameter(0.35)
     min_speed = rx.Parameter(0.30)
     max_lateral_accel = rx.Parameter(1.2)
     decel_distance = rx.Parameter(0.45)
 
-    # Look-ahead. Defaults are sized for a ~4 m path with ~0.4 m turn radius.
-    # The stock PurePursuitController floors this at 1.2 m, which would cut the
-    # entire corner off a path this short.
-    #
+    # --- look-ahead -------------------------------------------------------
     # Sweep on this path (kinematic sim, 0.35 m/s, 10 Hz, max_steering=0.698),
     # max cross-track / heading error at the cusp / % of steps saturated:
     #
@@ -174,11 +195,6 @@ class path_follower(rx.Node):
     #    0.30      0.068 m / 16.8 deg / 12%   0.067 m /  7.3 deg
     #    0.25      0.057 m / 15.8 deg /  8%   0.065 m /  5.2 deg   <-- chosen
     #    0.20      0.056 m / 12.1 deg / 20%   0.050 m /  1.8 deg
-    #
-    # 0.20 tracks marginally better but sits on the steering limit a fifth of
-    # the time, which leaves nothing for disturbance rejection. 0.25 keeps
-    # saturation at 8% and degrades gracefully: with a 0.20 m / 15 deg initial
-    # error the cross-track peaks at 0.200 m and still converges.
     lookahead_base = rx.Parameter(0.25)
     lookahead_gain = rx.Parameter(0.30)
     lookahead_min = rx.Parameter(0.18)
@@ -186,24 +202,24 @@ class path_follower(rx.Node):
     max_steering_rate = rx.Parameter(3.0)
     steering_margin = rx.Parameter(0.017)
 
-    # Termination / safety
+    # --- termination / safety --------------------------------------------
     goal_tolerance = rx.Parameter(0.08)
     max_cross_track = rx.Parameter(0.60)
     start_tolerance = rx.Parameter(1.00)
     odom_timeout = rx.Parameter(0.5)
 
-    # Cusp handling
+    # --- cusp handling ----------------------------------------------------
     stop_speed_threshold = rx.Parameter(0.03)
     brake_dwell = rx.Parameter(0.7)
     brake_timeout = rx.Parameter(4.0)
-    # Most RC ESCs in sports mode need neutral -> reverse -> neutral before
-    # they will actually accept reverse. Set to 0.0 to disable.
     esc_shift_pulse = rx.Parameter(0.15)
 
     control_rate = rx.Parameter(10.0)
     difflock = rx.Parameter(True)
 
-    is_sim = rx.Parameter(False)
+    # Hold the throttle for this long after seeding, so the filter has a cycle
+    # or two to converge onto the new pose before the car starts moving.
+    initial_pose_settle = rx.Parameter(1.0)
 
     # ------------------------------------------------------------ interfaces
 
@@ -215,13 +231,35 @@ class path_follower(rx.Node):
     # ---------------------------------------------------------------- startup
 
     @rx.Subscriber(Bool, '/csv_follower', qos_subber)
-    def start_sub(self, csv_follower_msg):
-        self.start = csv_follower_msg.data
+    def start_sub(self, msg):
+        if not msg.data:
+            self.start = False
+            self._settle_until = None
+            return
+        # Seed first, then let the filter settle before releasing the throttle.
+        # The delay is handled in loop() -- sleeping here would block the
+        # executor, stalling the control timer and the halt commands with it.
+        if not self._initial_pose_sent and self._pose_is_converted():
+            self._send_initial_pose()
+            self._settle_until = (self.get_clock().now().nanoseconds * 1e-9
+                                  + self.initial_pose_settle)
+        self.start = True
+
+    # NOTE: the mocap subscription and the initialpose publisher are created in
+    # on_startup, not declared here. Decorator and rx.Publisher arguments are
+    # evaluated at class-definition time, when mocap_pose_topic is still an
+    # rx.Parameter descriptor rather than the configured string -- the node
+    # would come up subscribed to the wrong name, silently.
 
     def on_startup(self):
-        # Set before anything can publish to /csv_follower, so an early
-        # message cannot hit an undefined attribute.
+        # Set before anything can arrive, so an early message cannot hit an
+        # undefined attribute.
         self.start = False
+        self.x = self.y = self.yaw = 0.0
+        self._tf = None
+        self._initial_pose_sent = False
+        self._last_mocap_t = None
+        self._last_odom_t = None
 
         if not self.path_csv or not os.path.isfile(self.path_csv):
             raise RuntimeError(f"path_csv not found: '{self.path_csv}'")
@@ -248,12 +286,31 @@ class path_follower(rx.Node):
         self._brake_t = 0.0
         self._stopped_t = None
         self._shift_t = None
-        self._last_odom_t = None
         self._tf_t0 = None
         self._tf_buffer = None
         self._tf_listener = None
 
         self.localizer.add_callback(self._on_odom)
+
+        # --- mocap plumbing, hardware only -------------------------------
+        self._initial_pose_pub = None
+        if not self.is_sim:
+            if self.publish_initial_pose:
+                self._initial_pose_pub = self.create_publisher(
+                    PoseWithCovarianceStamped,
+                    self.initial_pose_topic, qos_latched)
+            self.create_subscription(
+                PoseStamped, self.mocap_pose_topic,
+                self._on_mocap_pose, qos_subber)
+            self.get_logger().info(
+                f"pose from '{self.mocap_pose_topic}' (frame "
+                f"'{self.path_frame}'), initial pose to "
+                f"'{self.initial_pose_topic}'"
+                if self.publish_initial_pose else
+                f"pose from '{self.mocap_pose_topic}' (frame "
+                f"'{self.path_frame}'), initial pose disabled")
+        else:
+            self.get_logger().info("pose from LocalizationInterface (sim)")
 
         if self.difflock:
             self.actuation.enable_difflock()
@@ -263,17 +320,15 @@ class path_follower(rx.Node):
 
         if not needs_tf:
             self.get_logger().info(
-                f"path stays in '{self.path_frame}'; no frame conversion")
+                f"everything stays in '{self.path_frame}'; no frame conversion")
             self._load_path(None)
             self.state = State.WAIT_ODOM
         elif self.use_tf_override:
-            tf = (float(self.tf_override_x),
-                  float(self.tf_override_y),
-                  float(self.tf_override_yaw))
-            self.get_logger().info(
-                f"transform {self.target_frame} <- {self.path_frame} from "
-                f"tf_override parameters")
-            self._apply_transform(tf, "tf_override parameter")
+            self._apply_transform(
+                (float(self.tf_override_x),
+                 float(self.tf_override_y),
+                 float(self.tf_override_yaw)),
+                "tf_override parameters")
             self.state = State.WAIT_ODOM
         else:
             from tf2_ros import Buffer, TransformListener
@@ -287,8 +342,76 @@ class path_follower(rx.Node):
         self.create_timer(self.dt, self.loop)
         self.get_logger().info("path_follower ready")
 
+    # -------------------------------------------------------------- callbacks
+
     def _on_odom(self, msg):
         self._last_odom_t = self.get_clock().now().nanoseconds * 1e-9
+
+    def _on_mocap_pose(self, msg):
+        """Receive a mocap pose, convert it into target_frame, stash it.
+
+        Uses the transform cached by _apply_transform, so the pose and the path
+        are guaranteed to have gone through the same conversion.
+
+        Before the transform resolves, self._tf is None and apply_planar_tf is
+        the identity. That is harmless: the state machine is still in WAIT_TF,
+        the car is held at zero throttle, and no initialpose is emitted until
+        the transform exists.
+        """
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        yaw = quaternion_to_yaw(msg.pose.orientation)
+
+        self.x, self.y, self.yaw = apply_planar_tf(self._tf, x, y, yaw)
+        self._last_mocap_t = self.get_clock().now().nanoseconds * 1e-9
+
+
+    def _pose_is_converted(self):
+        """True once self.x/y/yaw are genuinely in target_frame."""
+        return self._tf is not None or not self._needs_conversion()
+
+    def _needs_conversion(self):
+        return bool(self.target_frame) and self.target_frame != self.path_frame
+
+    def _send_initial_pose(self):
+        """Seed the localizer with the converted mocap pose.
+
+        Three things this must get right, all of which have bitten before:
+
+        - PoseWithCovarianceStamped, not PoseStamped. That is what nav2_amcl
+          and robot_localization accept on this topic.
+        - header.frame_id must name the target frame. An empty string is
+          rejected outright, and publishing the raw mocap frame relies on the
+          consumer doing a TF lookup that it may not do -- some versions read
+          the numbers as if they were already in the map frame, which puts the
+          seed off by the whole mocap->map offset with no error anywhere.
+        - The covariance must not be all zeros, or every particle stacks onto
+          a single point and the filter cannot recover.
+        """
+        if self._initial_pose_pub is None:
+            return
+
+        out = PoseWithCovarianceStamped()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = self.target_frame or self.path_frame
+        out.pose.pose.position.x = float(self.x)
+        out.pose.pose.position.y = float(self.y)
+        out.pose.pose.position.z = 0.0
+        out.pose.pose.orientation.z = math.sin(self.yaw / 2.0)
+        out.pose.pose.orientation.w = math.cos(self.yaw / 2.0)
+
+        cov = [0.0] * 36
+        cov[0] = 0.25       # x
+        cov[7] = 0.25       # y
+        cov[35] = 0.0685    # yaw
+        out.pose.covariance = cov
+
+        self._initial_pose_pub.publish(out)
+        self._initial_pose_sent = True
+        self.get_logger().info(
+            f"published initial pose ({self.x:+.3f}, {self.y:+.3f}, "
+            f"{math.degrees(self.yaw):+.1f} deg) in "
+            f"'{out.header.frame_id}' on '{self.initial_pose_topic}'")
 
     # ------------------------------------------------------------ path load
 
@@ -301,17 +424,17 @@ class path_follower(rx.Node):
         self._publish_full_path()
 
     def _apply_transform(self, tf, source):
-        """Rewrite the CSV into target_frame, then load it.
+        """Cache the transform, rewrite the CSV into target_frame, then load it.
 
         Rewriting the file rather than mutating the loaded segment arrays means
         every derived quantity -- curvature, arc length, direction, and anything
-        else SegmentPath caches -- is computed from the transformed coordinates.
+        else PathSegment caches -- is computed from the transformed coordinates.
         A planar rigid transform leaves curvature and length unchanged, so both
         routes agree mathematically, but this one cannot go stale if
         segmented_pure_pursuit.py grows a new cached field later.
         """
+        self._tf = tf
         tx, ty, th = tf
-        c, s = math.cos(th), math.sin(th)
 
         rows = []
         with open(self.path_csv, "r") as f:
@@ -322,10 +445,11 @@ class path_follower(rx.Node):
                 raise RuntimeError(
                     f"CSV is missing column(s) {sorted(missing)}. Found: {fields}")
             for row in reader:
-                x, y = float(row["x"]), float(row["y"])
-                row["x"] = f"{tx + c * x - s * y:.6f}"
-                row["y"] = f"{ty + s * x + c * y:.6f}"
-                row["yaw"] = f"{wrap_to_pi(float(row['yaw']) + th):.6f}"
+                x, y, yaw = apply_planar_tf(
+                    tf, float(row["x"]), float(row["y"]), float(row["yaw"]))
+                row["x"] = f"{x:.6f}"
+                row["y"] = f"{y:.6f}"
+                row["yaw"] = f"{yaw:.6f}"
                 rows.append(row)
 
         if not rows:
@@ -346,6 +470,12 @@ class path_follower(rx.Node):
         self.get_logger().info(f"  rewrote {len(rows)} rows into {out}")
 
         self._load_path(out)
+
+        # A mocap pose may already have arrived and been stored unconverted.
+        # Re-run the conversion on the raw values is not possible (they were
+        # overwritten), so simply wait for the next message -- at mocap rates
+        # that is a few milliseconds. Emit the seed from that one instead.
+        self._last_mocap_t = None
 
     def _report_path(self):
         """Log the segment breakdown and flag anything the car cannot steer."""
@@ -399,18 +529,30 @@ class path_follower(rx.Node):
             self._halt()
             return
 
-        x, y, yaw, v = self.localizer.get_state()
+        if self._settle_until is not None:
+            if now < self._settle_until:
+                self._halt()
+                self.get_logger().info(
+                    "waiting for the localizer to settle after the pose seed...",
+                    throttle_duration_sec=0.5)
+                return
+            self._settle_until = None
+            self.get_logger().info("localizer settled, releasing throttle")
 
-        if self._last_odom_t is None:
-            self.get_logger().info("waiting for odometry...",
-                                   throttle_duration_sec=2.0)
+        # Speed always from the localizer (wheel encoders). Pose from the
+        # localizer in simulation, from mocap on hardware.
+        lx, ly, lyaw, v = self.localizer.get_state()
+        if self.is_sim:
+            x, y, yaw = lx, ly, lyaw
+        else:
+            x, y, yaw = self.x, self.y, self.yaw
+
+        if not self._pose_ready():
             self._halt()
             return
 
-        if self.state is not State.WAIT_ODOM and \
-                (now - self._last_odom_t) > self.odom_timeout:
-            return self._abort(
-                f"odometry stale by {now - self._last_odom_t:.2f} s")
+        if self.state is not State.WAIT_ODOM and not self._pose_fresh(now):
+            return
 
         handler = {
             State.WAIT_ODOM: self._do_wait,
@@ -418,6 +560,35 @@ class path_follower(rx.Node):
             State.BRAKE: self._do_brake,
         }[self.state]
         handler(x, y, yaw, v, now)
+
+    def _pose_ready(self):
+        if self._last_odom_t is None:
+            self.get_logger().info("waiting for odometry...",
+                                   throttle_duration_sec=2.0)
+            return False
+        if not self.is_sim and self._last_mocap_t is None:
+            self.get_logger().info(
+                f"waiting for mocap pose on '{self.mocap_pose_topic}'...",
+                throttle_duration_sec=2.0)
+            return False
+        return True
+
+    def _pose_fresh(self, now):
+        """Check both feeds. A live encoder feed alongside a dead mocap feed
+        would otherwise leave the controller steering against a frozen pose --
+        the pure pursuit target never appears to be reached, so the steering
+        winds up and stays there."""
+        age = now - self._last_odom_t
+        if age > self.odom_timeout:
+            self._abort(f"odometry stale by {age:.2f} s")
+            return False
+        if not self.is_sim:
+            age = now - self._last_mocap_t
+            if age > self.mocap_timeout:
+                self._abort(f"mocap pose stale by {age:.2f} s on "
+                            f"'{self.mocap_pose_topic}'")
+                return False
+        return True
 
     # ------------------------------------------------------------- state: TF
 
@@ -466,9 +637,10 @@ class path_follower(rx.Node):
         d = math.hypot(x - seg.xs[0], y - seg.ys[0])
         if d > self.start_tolerance:
             self.get_logger().warning(
-                f"vehicle is {d:.2f} m from the path start "
-                f"({seg.xs[0]:.2f}, {seg.ys[0]:.2f}) in '{self.target_frame}' "
-                f"-- check the initial pose before it drives off",
+                f"vehicle is at ({x:+.2f}, {y:+.2f}), {d:.2f} m from the path "
+                f"start ({seg.xs[0]:+.2f}, {seg.ys[0]:+.2f}) in "
+                f"'{self.target_frame}' -- check the initial pose before it "
+                f"drives off",
                 throttle_duration_sec=3.0)
             return
 
@@ -583,13 +755,7 @@ class path_follower(rx.Node):
     # ------------------------------------------------------------- actuation
 
     def _send(self, delta, speed):
-        """Apply the calibration corrections and push to the LLI.
-
-        Exactly one sign flip, controlled by velocity_sign. The previous
-        version multiplied by velocity_sign and then negated again at the
-        send_control call, so the two cancelled and the parameter did the
-        opposite of what it says.
-        """
+        """Apply the calibration corrections and push to the LLI."""
         delta = float(np.clip(delta, -self.max_steering, self.max_steering))
         cmd_steer = delta * self.steering_gain + self.steering_bias
         cmd_speed = speed * self.velocity_sign

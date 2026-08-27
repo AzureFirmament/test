@@ -11,12 +11,12 @@ from ament_index_python.packages import get_package_share_directory
 from better_launch import BetterLaunch, launch_this
 
 REAL_NAME = "self"
-SIM_NAME = "svea_a"
+SIM_NAME = "svea7"
 
 
 @launch_this
 def main(
-    is_sim: bool = True,
+    is_sim: bool = False,
     map_name: str = "sml",
     use_foxglove: bool = True,
     path_csv: str = "",
