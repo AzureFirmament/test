@@ -24,7 +24,7 @@ def main(
     # Start the car on the first point of the path, heading along it.
     initial_pose_x: float = 1.0,
     initial_pose_y: float = -2.5,
-    initial_pose_a: float = 1.5707963,
+    initial_pose_a: float = 1.57,
 ):
     bl = BetterLaunch()
 

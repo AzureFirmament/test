@@ -319,11 +319,18 @@ class SegmentPurePursuit:
         self._last_steering = delta
 
         # --- progress / termination ---------------------------------------
-        ux, uy = seg.travel_unit
+        # ux, uy = seg.travel_unit
+        # ex, ey = float(seg.txs[-1]) - rx, float(seg.tys[-1]) - ry
+        # remaining = ex * ux + ey * uy          # >0 while the end is ahead
+        # dist_to_end = math.hypot(ex, ey)
+
+        # finished = (remaining <= 0.0) or (dist_to_end <= self.goal_tolerance)
+        ux, uy = seg.travel_unit # 仅 decel ramp 用，保留
         ex, ey = float(seg.txs[-1]) - rx, float(seg.tys[-1]) - ry
-        remaining = ex * ux + ey * uy          # >0 while the end is ahead
         dist_to_end = math.hypot(ex, ey)
 
+        # 用弧长剩余代替投影 -- 对 U 形、绕回、近闭合段都正确
+        remaining = seg.length - seg.s[self._idx]
         finished = (remaining <= 0.0) or (dist_to_end <= self.goal_tolerance)
 
         # --- speed ----------------------------------------------------------
