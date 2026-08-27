@@ -4,13 +4,33 @@ Path follower for CSV paths containing cusps (direction reversals).
 
 Place in: csv_path_follower/scripts/path_follower.py
 
+Frames
+------
+
+The CSV may be recorded in a frame other than the one the localizer reports
+in -- typically a motion capture frame. Two parameters control this:
+
+    path_frame     the frame the CSV numbers are expressed in   (e.g. 'mocap')
+    target_frame   the frame the localizer reports in           (e.g. 'map')
+
+When they differ, the node waits for a planar transform target_frame <-
+path_frame, rewrites the CSV into target_frame, and only then builds the
+segments. Everything downstream -- pure pursuit, cross-track, markers,
+ShowPath -- therefore works in a single frame, the localizer's.
+
+This is deliberately NOT done by transforming the vehicle pose the other way:
+that would leave the published path and target markers in the mocap frame,
+where they cannot be compared against the map.
+
 State machine
 -------------
 
-    WAIT_ODOM --> DRIVE --> BRAKE --> DRIVE --> ... --> DONE
-                    |         |
-                    +---------+--> ABORT   (cross-track blown, odom stale)
+    WAIT_TF --> WAIT_ODOM --> DRIVE --> BRAKE --> DRIVE --> ... --> DONE
+                                 |        |
+                                 +--------+--> ABORT  (cross-track, odom stale)
 
+  WAIT_TF    resolve target_frame <- path_frame, then load the path. Skipped
+             entirely when no conversion is needed.
   WAIT_ODOM  wait for a fresh odometry message and check that the vehicle is
              actually near the start of the path.
   DRIVE      track the current segment with SegmentPurePursuit.
@@ -24,11 +44,22 @@ Run:
     bl csv_path_follower path_follower.launch.py is_sim:=True
 """
 
+import csv
 import math
 import os
+import tempfile
 from enum import Enum, auto
 
 import numpy as np
+
+import rclpy
+from rclpy.qos import (
+    QoSProfile,
+    QoSDurabilityPolicy,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+)
+from std_msgs.msg import Bool
 
 from svea_core import rosonic as rx
 from svea_core.interfaces import (
@@ -43,18 +74,23 @@ from svea_core.controllers.segmented_pure_pursuit import (
     SegmentPurePursuit,
 )
 
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import Bool
-
 qos_subber = QoSProfile(
-    reliability=QoSReliabilityPolicy.BEST_EFFORT,  # BEST_EFFORT
-    history=QoSHistoryPolicy.KEEP_LAST,         # Keep the last N messages
-    durability=QoSDurabilityPolicy.VOLATILE,    # Volatile
-    depth=10,                                   # Size of the queue
+    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    durability=QoSDurabilityPolicy.VOLATILE,
+    depth=10,
 )
 
 
+def quaternion_to_yaw(q) -> float:
+    """Planar yaw from a quaternion. Ignores roll/pitch by construction."""
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
 class State(Enum):
+    WAIT_TF = auto()
     WAIT_ODOM = auto()
     DRIVE = auto()
     BRAKE = auto()
@@ -68,6 +104,27 @@ class path_follower(rx.Node):
     # ---------------------------------------------------------------- params
 
     path_csv = rx.Parameter("")
+
+    # --- frames ---------------------------------------------------------
+    # path_frame:   what the CSV numbers mean.
+    # target_frame: what the localizer reports in. Set path_frame equal to
+    #               target_frame (or leave target_frame empty) to disable
+    #               conversion entirely.
+    path_frame = rx.Parameter("mocap")
+    target_frame = rx.Parameter("map")
+
+    # How long to wait for the transform before aborting. The vehicle is held
+    # at zero throttle for the whole wait, so a generous value is safe.
+    tf_timeout = rx.Parameter(15.0)
+
+    # Hand-supplied planar extrinsic target_frame <- path_frame, used when
+    # use_tf_override is true. Three scalars rather than a list: rosonic's
+    # declarative parameters and rcl both handle scalars more predictably,
+    # and it sidesteps the PyYAML float-notation traps.
+    use_tf_override = rx.Parameter(False)
+    tf_override_x = rx.Parameter(0.0)
+    tf_override_y = rx.Parameter(0.0)
+    tf_override_yaw = rx.Parameter(0.0)
 
     # Geometry. Wheelbase matches PurePursuitController in svea_core.
     wheelbase = rx.Parameter(0.324)
@@ -94,13 +151,13 @@ class path_follower(rx.Node):
     # counts for svea7 -- convert and put it here if you trust that number.
     steering_bias = rx.Parameter(0.0)
 
-    # The existing pure_pursuit.py example sends velocity * -1.0. Keep -1.0
-    # until you have confirmed the sign on the actual car with lli_test.
+    # Sign applied to the commanded velocity before it reaches the LLI.
+    # -1.0 inverts. Confirm on the actual car with lli_test before trusting it.
     velocity_sign = rx.Parameter(-1.0)
 
     # Speed profile
     target_speed = rx.Parameter(0.35)
-    min_speed = rx.Parameter(0.15)
+    min_speed = rx.Parameter(0.30)
     max_lateral_accel = rx.Parameter(1.2)
     decel_distance = rx.Parameter(0.45)
 
@@ -146,6 +203,8 @@ class path_follower(rx.Node):
     control_rate = rx.Parameter(10.0)
     difflock = rx.Parameter(True)
 
+    is_sim = rx.Parameter(False)
+
     # ------------------------------------------------------------ interfaces
 
     actuation = ActuationInterface()
@@ -156,15 +215,18 @@ class path_follower(rx.Node):
     # ---------------------------------------------------------------- startup
 
     @rx.Subscriber(Bool, '/csv_follower', qos_subber)
-    def imu_sub(self, csv_follower_msg):
+    def start_sub(self, csv_follower_msg):
         self.start = csv_follower_msg.data
 
     def on_startup(self):
+        # Set before anything can publish to /csv_follower, so an early
+        # message cannot hit an undefined attribute.
+        self.start = False
+
         if not self.path_csv or not os.path.isfile(self.path_csv):
             raise RuntimeError(f"path_csv not found: '{self.path_csv}'")
 
-        self.segments = load_segments_from_csv(self.path_csv,
-                                               wheelbase=self.wheelbase)
+        self.segments = None
         self.seg_i = 0
 
         self.controller = SegmentPurePursuit(
@@ -182,30 +244,108 @@ class path_follower(rx.Node):
             goal_tolerance=self.goal_tolerance,
         )
 
-        self._report_path()
-        self._publish_full_path()
-
-        self.state = State.WAIT_ODOM
         self.dt = 1.0 / self.control_rate
         self._brake_t = 0.0
         self._stopped_t = None
         self._shift_t = None
         self._last_odom_t = None
-
-        self.start = False
+        self._tf_t0 = None
+        self._tf_buffer = None
+        self._tf_listener = None
 
         self.localizer.add_callback(self._on_odom)
 
         if self.difflock:
             self.actuation.enable_difflock()
 
+        # --- decide whether a frame conversion is needed -----------------
+        needs_tf = bool(self.target_frame) and self.target_frame != self.path_frame
+
+        if not needs_tf:
+            self.get_logger().info(
+                f"path stays in '{self.path_frame}'; no frame conversion")
+            self._load_path(None)
+            self.state = State.WAIT_ODOM
+        elif self.use_tf_override:
+            tf = (float(self.tf_override_x),
+                  float(self.tf_override_y),
+                  float(self.tf_override_yaw))
+            self.get_logger().info(
+                f"transform {self.target_frame} <- {self.path_frame} from "
+                f"tf_override parameters")
+            self._apply_transform(tf, "tf_override parameter")
+            self.state = State.WAIT_ODOM
+        else:
+            from tf2_ros import Buffer, TransformListener
+            self._tf_buffer = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self)
+            self.state = State.WAIT_TF
+            self.get_logger().info(
+                f"waiting for transform {self.target_frame} <- "
+                f"{self.path_frame} before loading the path")
+
         self.create_timer(self.dt, self.loop)
-        self.get_logger().info(
-            f"path_follower ready: {len(self.segments)} segment(s) from "
-            f"{os.path.basename(self.path_csv)}, waiting for odometry")
+        self.get_logger().info("path_follower ready")
 
     def _on_odom(self, msg):
         self._last_odom_t = self.get_clock().now().nanoseconds * 1e-9
+
+    # ------------------------------------------------------------ path load
+
+    def _load_path(self, csv_override):
+        """Build the segments, from the original CSV or a rewritten one."""
+        source = csv_override or self.path_csv
+        self.segments = load_segments_from_csv(source, wheelbase=self.wheelbase)
+        self.seg_i = 0
+        self._report_path()
+        self._publish_full_path()
+
+    def _apply_transform(self, tf, source):
+        """Rewrite the CSV into target_frame, then load it.
+
+        Rewriting the file rather than mutating the loaded segment arrays means
+        every derived quantity -- curvature, arc length, direction, and anything
+        else SegmentPath caches -- is computed from the transformed coordinates.
+        A planar rigid transform leaves curvature and length unchanged, so both
+        routes agree mathematically, but this one cannot go stale if
+        segmented_pure_pursuit.py grows a new cached field later.
+        """
+        tx, ty, th = tf
+        c, s = math.cos(th), math.sin(th)
+
+        rows = []
+        with open(self.path_csv, "r") as f:
+            reader = csv.DictReader(f)
+            fields = list(reader.fieldnames or [])
+            missing = {"x", "y", "yaw"} - set(fields)
+            if missing:
+                raise RuntimeError(
+                    f"CSV is missing column(s) {sorted(missing)}. Found: {fields}")
+            for row in reader:
+                x, y = float(row["x"]), float(row["y"])
+                row["x"] = f"{tx + c * x - s * y:.6f}"
+                row["y"] = f"{ty + s * x + c * y:.6f}"
+                row["yaw"] = f"{wrap_to_pi(float(row['yaw']) + th):.6f}"
+                rows.append(row)
+
+        if not rows:
+            raise RuntimeError(f"no data rows in '{self.path_csv}'")
+
+        base = os.path.basename(self.path_csv).rsplit(".", 1)[0]
+        out = os.path.join(tempfile.gettempdir(),
+                           f"{base}.{self.target_frame.replace('/', '_')}.csv")
+        with open(out, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        self.get_logger().info(
+            f"transform {self.target_frame} <- {self.path_frame} from {source}: "
+            f"translation ({tx:+.3f}, {ty:+.3f}) m, rotation "
+            f"{math.degrees(th):+.2f} deg")
+        self.get_logger().info(f"  rewrote {len(rows)} rows into {out}")
+
+        self._load_path(out)
 
     def _report_path(self):
         """Log the segment breakdown and flag anything the car cannot steer."""
@@ -242,34 +382,80 @@ class path_follower(rx.Node):
     # ------------------------------------------------------------- main loop
 
     def loop(self):
-        if self.start:
-            if self.state in (State.DONE, State.ABORT):
-                self._halt()
-                return
-
-            x, y, yaw, v = self.localizer.get_state()
-            now = self.get_clock().now().nanoseconds * 1e-9
-
-            if self._last_odom_t is None:
-                self.get_logger().info("waiting for odometry...",
-                                    throttle_duration_sec=2.0)
-                self._halt()
-                return
-
-            if self.state is not State.WAIT_ODOM and \
-                    (now - self._last_odom_t) > self.odom_timeout:
-                return self._abort(
-                    f"odometry stale by {now - self._last_odom_t:.2f} s")
-
-            handler = {
-                State.WAIT_ODOM: self._do_wait,
-                State.DRIVE: self._do_drive,
-                State.BRAKE: self._do_brake,
-            }[self.state]
-            handler(x, y, yaw, v, now)
-        else:
+        if self.state in (State.DONE, State.ABORT):
             self._halt()
+            return
 
+        now = self.get_clock().now().nanoseconds * 1e-9
+
+        # Resolve the transform regardless of self.start. It costs nothing,
+        # the car is held at zero throttle throughout, and having it done
+        # early means the start signal is not delayed by a TF handshake.
+        if self.state is State.WAIT_TF:
+            self._do_wait_tf(now)
+            return
+
+        if not self.start:
+            self._halt()
+            return
+
+        x, y, yaw, v = self.localizer.get_state()
+
+        if self._last_odom_t is None:
+            self.get_logger().info("waiting for odometry...",
+                                   throttle_duration_sec=2.0)
+            self._halt()
+            return
+
+        if self.state is not State.WAIT_ODOM and \
+                (now - self._last_odom_t) > self.odom_timeout:
+            return self._abort(
+                f"odometry stale by {now - self._last_odom_t:.2f} s")
+
+        handler = {
+            State.WAIT_ODOM: self._do_wait,
+            State.DRIVE: self._do_drive,
+            State.BRAKE: self._do_brake,
+        }[self.state]
+        handler(x, y, yaw, v, now)
+
+    # ------------------------------------------------------------- state: TF
+
+    def _do_wait_tf(self, now):
+        self._halt()
+
+        if self._tf_t0 is None:
+            self._tf_t0 = now
+
+        from tf2_ros import TransformException
+        try:
+            tr = self._tf_buffer.lookup_transform(
+                self.target_frame, self.path_frame, rclpy.time.Time()).transform
+        except TransformException as exc:
+            if (now - self._tf_t0) > self.tf_timeout:
+                return self._abort(
+                    f"no transform {self.target_frame} <- {self.path_frame} "
+                    f"after {self.tf_timeout:.0f} s: {exc}. Either the static "
+                    f"broadcaster is not running, or set use_tf_override with "
+                    f"the extrinsic measured by hand.")
+            self.get_logger().info(
+                f"waiting for {self.target_frame} <- {self.path_frame}...",
+                throttle_duration_sec=2.0)
+            return
+
+        if abs(tr.translation.z) > 1e-3:
+            self.get_logger().warning(
+                f"transform has z offset {tr.translation.z:+.3f} m; this node "
+                f"is planar and drops it")
+        q = tr.rotation
+        if abs(q.x) > 1e-3 or abs(q.y) > 1e-3:
+            self.get_logger().warning(
+                "transform has non-negligible roll/pitch; only yaw is kept, "
+                "so the converted path will be approximate")
+
+        self._apply_transform(
+            (tr.translation.x, tr.translation.y, quaternion_to_yaw(q)), "TF")
+        self.state = State.WAIT_ODOM
 
     # ----------------------------------------------------------- state: WAIT
 
@@ -281,8 +467,8 @@ class path_follower(rx.Node):
         if d > self.start_tolerance:
             self.get_logger().warning(
                 f"vehicle is {d:.2f} m from the path start "
-                f"({seg.xs[0]:.2f}, {seg.ys[0]:.2f}) -- "
-                f"check the initial pose before it drives off",
+                f"({seg.xs[0]:.2f}, {seg.ys[0]:.2f}) in '{self.target_frame}' "
+                f"-- check the initial pose before it drives off",
                 throttle_duration_sec=3.0)
             return
 
@@ -397,11 +583,20 @@ class path_follower(rx.Node):
     # ------------------------------------------------------------- actuation
 
     def _send(self, delta, speed):
-        """Apply the calibration corrections and push to the LLI."""
+        """Apply the calibration corrections and push to the LLI.
+
+        Exactly one sign flip, controlled by velocity_sign. The previous
+        version multiplied by velocity_sign and then negated again at the
+        send_control call, so the two cancelled and the parameter did the
+        opposite of what it says.
+        """
         delta = float(np.clip(delta, -self.max_steering, self.max_steering))
         cmd_steer = delta * self.steering_gain + self.steering_bias
         cmd_speed = speed * self.velocity_sign
-        self.actuation.send_control(cmd_steer, -cmd_speed)
+        if self.is_sim:
+            self.actuation.send_control(cmd_steer, -cmd_speed)
+        else:
+            self.actuation.send_control(cmd_steer, cmd_speed)
 
     def _halt(self):
         self.actuation.send_control(0.0, 0.0)

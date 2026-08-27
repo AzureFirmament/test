@@ -22,9 +22,9 @@ def main(
     path_csv: str = "",
     target_speed: float = 0.35,
     # Start the car on the first point of the path, heading along it.
-    initial_pose_x: float = 1.0,
-    initial_pose_y: float = -2.5,
-    initial_pose_a: float = 1.57,
+    initial_pose_x: float = -2.51,
+    initial_pose_y: float = -0.96,
+    initial_pose_a: float = 0.0,
 ):
     bl = BetterLaunch()
 
@@ -35,7 +35,7 @@ def main(
 
     name = SIM_NAME if is_sim else REAL_NAME
 
-    bl.include("svea_core", "svea.launch.py",
+    bl.include("csv_path_follower", "svea_mocap.launch.py",
                name=name,
                is_sim=is_sim,
                map_name=map_name,
@@ -50,7 +50,14 @@ def main(
                     "path_csv": path_csv,
                     "target_speed": target_speed,
                     "localization/base_frame": f"{name}/base_link",
+                    "is_sim": is_sim,
                 })
+
+    bl.node("csv_path_follower", "path_viz.py",
+            name="path_visualizer",
+            params={
+                "path_csv": path_csv,
+            })
 
     if use_foxglove:
         bl.include("foxglove_bridge", "foxglove_bridge_launch.xml")

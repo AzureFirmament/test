@@ -63,7 +63,7 @@ class PathViz(Node):
 
         self.declare_parameter("path_csv", "/svea_ws/src/csv_path_follower/paths/tiha_path_data.csv")
         self.declare_parameter("map_yaml", "/svea_ws/src/svea_core/maps/sml.yaml")
-        self.declare_parameter("frame_id", "map")
+        self.declare_parameter("frame_id", "mocap")
         self.declare_parameter("publish_period", 1.0)
         self.declare_parameter("point_size", 0.04)
         self.declare_parameter("line_width", 0.02)

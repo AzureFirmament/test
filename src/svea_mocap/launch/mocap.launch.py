@@ -10,9 +10,9 @@ def toargs(**kwds):
 
 @launch_this
 def main(              # For SML:
-    map_x: float = 0., #    = 0.06,
-    map_y: float = 0., #    = -0.06,
-    map_a: float = 0., #    = 1.57,
+    map_x: float = 0.06, #    = 0.06,
+    map_y: float = -0.06, #    = -0.06,
+    map_a: float = 1.57, #    = 1.57,
     mocap_frame: str = "mocap",
     map_frame: str = "map",
 ):
