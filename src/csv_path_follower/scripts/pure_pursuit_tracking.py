@@ -60,7 +60,7 @@ from rclpy.qos import (
     QoSHistoryPolicy,
 )
 from std_msgs.msg import Bool
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped
 
 from svea_core import rosonic as rx
 from svea_core.interfaces import (
@@ -311,6 +311,19 @@ class path_follower(rx.Node):
                 f"'{self.path_frame}'), initial pose disabled")
         else:
             self.get_logger().info("pose from LocalizationInterface (sim)")
+
+        # --- recording hooks ----------------------------------------------
+        # Relative names on purpose: bl.group(name) namespaces them, so the
+        # recorder launched in the same group hears them without any leading
+        # slashes (leading slashes would double-nest, see launch notes).
+        #   ctrl_info  TwistStamped: angular.z = steering [rad] (pre gain/bias),
+        #              linear.x = signed commanded speed [m/s]
+        #   path_done  Bool, latched: True once the last segment completes or
+        #              the follower aborts.
+        self._ctrl_info_pub = self.create_publisher(
+            TwistStamped, "ctrl_info", 10)
+        self._done_pub = self.create_publisher(
+            Bool, "path_done", qos_latched)
 
         if self.difflock:
             self.actuation.enable_difflock()
@@ -725,6 +738,7 @@ class path_follower(rx.Node):
             self.get_logger().info("--> DONE (all segments complete)")
             self.state = State.DONE
             self._halt()
+            self._publish_done()
             return
 
         # 2. ESC shift sequence, only when the direction actually flips
@@ -763,14 +777,35 @@ class path_follower(rx.Node):
             self.actuation.send_control(cmd_steer, -cmd_speed)
         else:
             self.actuation.send_control(cmd_steer, cmd_speed)
+        self._publish_ctrl_info(delta, speed)
 
     def _halt(self):
         self.actuation.send_control(0.0, 0.0)
+        self._publish_ctrl_info(0.0, 0.0)
+
+    def _publish_ctrl_info(self, delta, speed):
+        """Mirror the logical command (steering angle, signed speed) for the
+        path recorder. Logical, not calibrated: gain/bias/velocity_sign are
+        servo-side corrections and would only obscure the recorded data."""
+        pub = getattr(self, "_ctrl_info_pub", None)
+        if pub is None:
+            return
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.twist.angular.z = float(delta)
+        msg.twist.linear.x = float(speed)
+        pub.publish(msg)
+
+    def _publish_done(self):
+        pub = getattr(self, "_done_pub", None)
+        if pub is not None:
+            pub.publish(Bool(data=True))
 
     def _abort(self, reason):
         self.get_logger().error(f"ABORT: {reason}")
         self.state = State.ABORT
         self._halt()
+        self._publish_done()
 
     def on_shutdown(self):
         self._halt()

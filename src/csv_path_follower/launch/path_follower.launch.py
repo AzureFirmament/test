@@ -21,6 +21,9 @@ def main(
     use_foxglove: bool = True,
     path_csv: str = "",
     target_speed: float = 0.35,
+    # Recording
+    use_recorder: bool = True,
+    record_dir: str = "/svea_ws/tmp/path_logs",
     # Start the car on the first point of the path, heading along it.
     initial_pose_x: float = -2.51,
     initial_pose_y: float = -0.96,
@@ -52,6 +55,18 @@ def main(
                     "localization/base_frame": f"{name}/base_link",
                     "is_sim": is_sim,
                 })
+
+        # Hardware only: the recorder logs raw mocap poses, and in sim there
+        # is no mocap feed -- so it is not launched at all when is_sim.
+        if use_recorder and not is_sim:
+            # Same group as the follower, so the relative 'ctrl_info' and
+            # 'path_done' names resolve to the same /<name>/... topics the
+            # follower publishes on. Do NOT add leading slashes here.
+            bl.node("csv_path_follower", "path_recorder.py",
+                    name="path_recorder",
+                    params={
+                        "output_dir": record_dir,
+                    })
 
     bl.node("csv_path_follower", "path_viz.py",
             name="path_visualizer",
